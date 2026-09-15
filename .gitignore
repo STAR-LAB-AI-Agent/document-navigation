@@ -1,0 +1,13 @@
+# Python 虚拟环境 / 缓存 / 日志(运行时自动生成,不入库)
+.venv/
+.cache/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 根目录的任务书 PDF 与 test_data/ 中重复,不重复入库
+/智能体开发实战_课程实验任务书.pdf
+
+# 测试临时文件
+test_data/not_a_pdf.txt

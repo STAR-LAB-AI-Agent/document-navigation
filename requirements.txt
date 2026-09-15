@@ -1,0 +1,3 @@
+docling==2.126.0
+pymupdf==1.28.2
+pytest==9.1.1
