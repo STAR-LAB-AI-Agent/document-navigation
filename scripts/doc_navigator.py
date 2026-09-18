@@ -4,14 +4,22 @@
 doc-navigator:AI 文档结构导航(实验第 10 题)
 ================================================
 
-基于 Docling 解析文本型 PDF 的标题、章节和列表结构,生成目录,
-并根据自然语言指令定位目标章节或页面,支持跳转打开对应页面。
+基于 Docling 解析文本型 PDF 的标题、章节和列表结构,生成目录与层级化章节导航,
+并根据自然语言指令定位目标章节或页面。"跳转"通过生成可点击的章节/页码链接实现——
+依靠目录结果即可定位到目标章节,不调用任何 Docling 以外的外部工具去切换页面。
+
+为了让链接在 webui 与终端里都真正可点(浏览器禁止 http 页面点击 file:// 链接,
+终端裸 URL 文本不可点击),链接默认经由 skill 内嵌的本地 HTTP 服务提供:
+纯 Python 标准库实现,只绑定 127.0.0.1、只服务目标 PDF 一个文件,由脚本自身
+以分离进程启动,空闲 15 分钟自动退出;全程不打开任何阅读器/浏览器。端口耗尽等
+导致服务起不来时,不整体失败——自动退回 file:/// 链接并在 message 中如实说明。
 
 子命令:
     parse   <pdf>                  解析文档结构(标题/章节树/列表)
-    toc     <pdf> [--json]         生成目录(默认 Markdown,--json 结构化)
+    toc     <pdf> [--json] [--links]  生成目录(默认 Markdown,--links 可点击)
     locate  <pdf> --query "..."/--page N   定位章节或页面
-    open    <pdf> --page N/--section "..." 生成跳转链接(--launch 实际打开)
+    link    <pdf> --page N/--section "..." 生成对应页面/章节的可点击跳转链接
+    (_serve-daemon / _serve-stop 为内嵌 HTTP 服务的内部管理命令,不面向用户)
 
 统一输出 JSON(status/message/data),退出码:0 成功 2 未找到 3 文件错误 4 解析/执行失败。
 页码一律为 PDF 物理页码(从 1 开始)。
@@ -20,14 +28,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.server
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import threading
 import time
-import webbrowser
+import urllib.parse
+import urllib.request
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -270,8 +283,237 @@ def build_sections(structure: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# 输出辅助
+# 跳转链接生成 + 内嵌本地 HTTP 服务
 # --------------------------------------------------------------------------
+# 背景:webui 页面里的 file:// 链接会被浏览器安全策略拦截(http 页面禁止跳转
+# file: 协议),终端里裸 URL 文本也不可点击。因此跳转链接默认经由本 skill
+# 内嵌的本地 HTTP 服务(纯 Python 标准库实现,绑定 127.0.0.1,不调用任何
+# 外部程序、不打开阅读器,空闲自动退出)提供,生成 http://127.0.0.1:PORT/
+# <文件名>#page=N 链接——webui 和终端里的 Markdown 链接均可点击,浏览器
+# 自带 PDF 查看器支持 #page=N 定位到具体页。
+
+_SERVE_PORT_START = 8787
+_SERVE_PORT_END = 8797
+_SERVE_PING_PATH = "/doc-navigator-ping"
+_SERVE_IDLE_DEFAULT = 900  # 秒:无任何请求时守护进程自动退出
+
+
+class ServeError(RuntimeError):
+    """内嵌 HTTP 服务不可用(端口耗尽或启动失败)。
+
+    调用方不应因此整体失败:http 链接只是让链接更易点击的手段,退回 file:/// 链接
+    仍可完成"生成跳转链接"这件事,所以 link/toc 捕获本异常后走兜底方案。
+    """
+
+
+def page_link(pdf_path: Path, page: int) -> str:
+    """生成指向 PDF 指定页的 file:// 链接(#page=N 片段为 PDF 标准跳页语法,
+    多数浏览器/阅读器点击后直接定位到该页)。作为 http 链接不可用时的兜底。"""
+    return pdf_path.resolve().as_uri() + f"#page={page}"
+
+
+def http_page_link(port: int, pdf_path: Path, page: int) -> str:
+    """生成经由内嵌 HTTP 服务的跳转链接(浏览器/终端均可点击)。"""
+    name = urllib.parse.quote(pdf_path.name)
+    return f"http://127.0.0.1:{port}/{name}#page={page}"
+
+
+def md_link(text: str, url: str) -> str:
+    """转义 Markdown 链接文本中的方括号,生成 [文本](链接)。"""
+    safe = text.replace("[", "\\[").replace("]", "\\]")
+    return f"[{safe}]({url})"
+
+
+def _serve_state_file() -> Path:
+    return CACHE_DIR / "serve_state.json"
+
+
+def _load_serve_state() -> list[dict]:
+    try:
+        with open(_serve_state_file(), encoding="utf-8") as f:
+            return [e for e in json.load(f) if isinstance(e, dict)]
+    except (OSError, ValueError):
+        return []
+
+
+def _save_serve_state(entries: list[dict]) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_serve_state_file(), "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False)
+    except OSError:
+        pass  # 状态文件写失败只影响复用,不影响本次链接
+
+
+def _ping_serve(port: int) -> bool:
+    """探测端口上是否运行着本 skill 的 HTTP 服务。"""
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}{_SERVE_PING_PATH}", timeout=1.5) as r:
+            return r.status == 200 and b"doc-navigator" in r.read(64)
+    except OSError:
+        return False
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _spawn_serve_daemon(port: int, pdf: Path, idle: int) -> int:
+    """以分离进程启动内嵌 HTTP 服务(仅服务这一个 PDF 文件),返回其 pid。"""
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_serve-daemon",
+           "--port", str(port), "--root", str(pdf.resolve().parent),
+           "--name", pdf.name, "--idle-timeout", str(idle)]
+    kwargs: dict = {"cwd": str(SKILL_ROOT),
+                    "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(cmd, close_fds=True, **kwargs).pid
+
+
+def ensure_http_serve(pdf: Path, idle: int = _SERVE_IDLE_DEFAULT) -> int:
+    """确保存在一个正在服务该 PDF 的内嵌 HTTP 服务,返回其端口。
+
+    已有服务直接复用;否则从未占用端口中挑选一个启动守护进程并等待就绪。
+    端口耗尽或启动失败时抛 ServeError,由调用方退回 file:/// 链接。
+    """
+    root = str(pdf.resolve().parent)
+    name = pdf.name
+    state = [e for e in _load_serve_state() if _ping_serve(int(e["port"]))]
+    for e in state:
+        if e.get("root") == root and e.get("name") == name:
+            _save_serve_state(state)
+            return int(e["port"])
+    used = {int(e["port"]) for e in state}
+    for port in range(_SERVE_PORT_START, _SERVE_PORT_END + 1):
+        if port in used or not _port_free(port):
+            continue
+        try:
+            pid = _spawn_serve_daemon(port, pdf, idle)
+        except OSError as exc:
+            raise ServeError(f"内嵌 HTTP 服务进程启动失败:{exc}") from exc
+        for _ in range(10):  # 最多等 ~5s 就绪
+            if _ping_serve(port):
+                state.append({"port": port, "root": root, "name": name,
+                              "pid": pid, "started": int(time.time())})
+                _save_serve_state(state)
+                return port
+            time.sleep(0.5)
+    raise ServeError(
+        f"端口 {_SERVE_PORT_START}~{_SERVE_PORT_END} 均被占用,无法启动内嵌 HTTP 服务")
+
+
+def _serve_stop_all() -> None:
+    """终止所有本 skill 启动的 HTTP 守护进程并清空状态。"""
+    entries = _load_serve_state()
+    for e in entries:
+        port = int(e.get("port", 0))
+        if _ping_serve(port):
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/PID", str(e["pid"])],
+                                   capture_output=True, timeout=10)
+                elif e.get("pid"):
+                    os.kill(int(e["pid"]), 15)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    _save_serve_state([])
+
+
+class _SingleFileHandler(http.server.BaseHTTPRequestHandler):
+    """只服务启动时指定的那一个 PDF 文件;其余路径一律 404。"""
+
+    server_version = "doc-navigator-serve/1"
+
+    def _emit(self, code: int, ctype: str, body: bytes = b"") -> None:
+        self.send_response(code)
+        if ctype:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _serve_target(self) -> None:
+        rec = getattr(self.server, "serve_record", {})
+        on_hit = getattr(self.server, "on_request", None)
+        if on_hit:
+            on_hit()
+
+        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+        if path == _SERVE_PING_PATH:
+            self._emit(200, "text/plain; charset=utf-8",
+                       "doc-navigator serve ok".encode("utf-8"))
+            return
+        target = "/" + rec.get("name", "")
+        if sys.platform == "win32":
+            path, target = path.lower(), target.lower()
+        if path != target:
+            self._emit(404, "text/plain; charset=utf-8", b"not found")
+            return
+        pdf = Path(rec.get("root", "")) / rec.get("name", "")
+        try:
+            with open(pdf, "rb") as f:
+                body = f.read()
+        except OSError:
+            self._emit(404, "text/plain; charset=utf-8", b"file unavailable")
+            return
+        fname = urllib.parse.quote(pdf.name)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Content-Disposition",
+                         f"inline; filename*=UTF-8''{fname}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    do_GET = _serve_target
+    do_HEAD = _serve_target
+
+    def log_message(self, fmt, *args):  # 静默访问日志
+        pass
+
+
+def run_serve_daemon(args) -> int:
+    """内嵌 HTTP 服务主循环:启动即服务,空闲 idle 秒后自动退出。"""
+    root = Path(args.root)
+    pdf = root / args.name
+    if not pdf.is_file():
+        print(out_json(make_result("error", f"服务目标不存在:{pdf}")))
+        return EXIT_FILE
+
+    last_hit = {"t": time.time()}
+
+    class Handler(_SingleFileHandler):
+        pass
+
+    try:
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", args.port), Handler)
+    except OSError as exc:
+        print(out_json(make_result("error", f"端口 {args.port} 绑定失败:{exc}")))
+        return EXIT_PARSE
+
+    server.serve_record = {"root": str(root), "name": args.name}
+    server.on_request = lambda: last_hit.update(t=time.time())
+
+    t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5},
+                         daemon=True)
+    t.start()
+    while True:
+        time.sleep(0.5)
+        if time.time() - last_hit["t"] > args.idle_timeout:
+            break
+    server.shutdown()
+    return EXIT_OK
 def out_json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ": "))
 
@@ -299,16 +541,73 @@ def norm_ws_join(text: str) -> str:
     return _WS.sub(" ", text or "").strip()
 
 
-def sections_markdown(sections: list[dict], title: str, num_pages: int) -> str:
-    lines = [f"# 目录 | {title}", f"> 共 {num_pages} 页 · {len(sections)} 个章节条目", ""]
-    for s in sections:
-        if s.get("is_title"):
-            continue
-        indent = "  " * (s["level"] - 1)
-        rng = f"第{s['page_start']}页" if s["page_start"] == s["page_end"] \
-            else f"第{s['page_start']}-{s['page_end']}页"
-        lines.append(f"{indent}- {s['title']}({rng})")
-    return "\n".join(lines)
+def tree_prefix(level: int) -> str:
+    """层级可视前缀:1 级无前缀,子级用 └ 加缩进递进。
+
+    层级全靠前缀字符表达,不依赖行首缩进;这样即便渲染器把相邻行合并成
+    一行(markdown 里子项会因此变成父项段落的一部分),层级依然看得见。
+    """
+    return "" if level <= 1 else "　" * (level - 1) + "└"
+
+
+def page_range_text(s: dict) -> str:
+    return f"第{s['page_start']}页" if s["page_start"] == s["page_end"] \
+        else f"第{s['page_start']}-{s['page_end']}页"
+
+
+def sections_markdown(sections: list[dict], title: str, num_pages: int,
+                      link_for=None, style: str = "table") -> str:
+    """生成 Markdown 目录。
+
+    style="table"(默认):每条目一行的表格。表格行的层级由第一列的前缀字符
+    表达,不依赖行首缩进/Markdown 嵌套列表——部分聊天前端(如 nanobot webui)
+    会把助手消息中相邻的行合并成一行,嵌套列表在那样的渲染下会挤成一坨;
+    表格每行自带 `|` 分隔,即便也被合并,层级前缀与页码列依然可读。
+
+    style="list":嵌套 Markdown 列表(终端/标准渲染器下的经典形式)。
+
+    传入 link_for(页码 → 链接)时,只有章节标题带链接,页码为纯文本:标题与页码
+    本就指向同一个 URL,两处都写成链接会让 URL 在长目录里重复一遍、token 近乎
+    翻倍;而聊天前端对单条消息有输出上限(如 nanobot 默认 8192 tokens),超限后
+    消息从中间被截断,续写部分没有表头,表格后半段就无法渲染成表格。
+    """
+    shown = [s for s in sections if not s.get("is_title")]
+    head = [f"# 目录 | {title}", f"> 共 {num_pages} 页 · {len(sections)} 个章节条目", ""]
+    lines: list[str] = []
+    if style == "list":
+        for s in shown:
+            indent = "  " * (s["level"] - 1)
+            rng = page_range_text(s)
+            if link_for is not None:
+                lines.append(f"{indent}- {md_link(s['title'], link_for(s['page_start']))}({rng})")
+            else:
+                lines.append(f"{indent}- {s['title']}({rng})")
+    else:
+        lines = ["| 章节 | 页码 |", "| --- | --- |"]
+        for s in shown:
+            cell = tree_prefix(s["level"]) + s["title"]
+            rng = page_range_text(s)
+            if link_for is not None:
+                lines.append(f"| {md_link(cell, link_for(s['page_start']))} | {rng} |")
+            else:
+                lines.append(f"| {cell} | {rng} |")
+    return "\n".join(head + lines)
+
+
+def make_link_for(pdf: Path, use_http: bool) -> tuple[Callable[[int], str], str]:
+    """返回 (页码 → 链接 的函数, 实际使用的方案 "http"/"file")。
+
+    use_http 时先确保内嵌 HTTP 服务就绪;服务不可用(端口耗尽等)时不报错,
+    自动退回 file:/// 链接——目录与跳转链接本身仍然生成得出来。
+    """
+    if use_http:
+        try:
+            port = ensure_http_serve(pdf)
+        except ServeError:
+            pass
+        else:
+            return (lambda page: http_page_link(port, pdf, page)), "http"
+    return (lambda page: page_link(pdf, page)), "file"
 
 
 # --------------------------------------------------------------------------
@@ -386,11 +685,20 @@ def _summary_for_log(command: str, result: dict) -> str:
     if command == "parse":
         return f"sections={len(d.get('sections', []))} lists={d.get('lists_total', 0)}"
     if command == "toc":
-        return f"sections={len(d.get('sections', []))}"
+        # 不带 --json 时 data 里只有 toc_markdown,按目录输出行统计,避免记成 0
+        # (与 message 里"12 个条目"口径一致:含文档标题)
+        if isinstance(d.get("sections"), list):
+            return f"sections={len(d['sections'])}"
+        entries = sum(
+            1 for line in (d.get("toc_markdown") or "").splitlines()
+            if line.lstrip().startswith("- ")                       # 列表形态
+            or (line.startswith("| ") and "---" not in line)        # 表格形态(含表头)
+        )
+        return f"sections={entries}"
     if command == "locate":
         return f"matches={len(d.get('matches', []))} mode={d.get('mode', '')}"
-    if command == "open":
-        return f"url_generated={'url' in d} launched={d.get('launched', False)}"
+    if command == "link":
+        return f"url_scheme={d.get('url_scheme', '')} url={'url' in d}"
     return ""
 
 
@@ -420,6 +728,17 @@ def cmd_parse(args, pdf: Path) -> dict:
 def cmd_toc(args, pdf: Path) -> dict:
     structure, cache = parse_pdf(pdf, use_cache=not args.no_cache)
     sections = build_sections(structure)
+
+    link_for, scheme, note = None, None, ""
+    if args.links or args.file_url:  # --file-url 隐含 --links
+        link_for, scheme = make_link_for(pdf, use_http=not args.file_url)
+        if scheme == "file" and not args.file_url:
+            note = ("内嵌 HTTP 服务不可用,目录中的链接已退回 file:///:"
+                    "部分浏览器会拦截 file://,请在终端或本地阅读器中打开。")
+
+    md = sections_markdown(sections, structure["title"], structure["num_pages"], link_for,
+                           style="list" if args.list else "table")
+    data: dict = {"toc_markdown": md}
     if args.json:
         data = {
             "title": structure["title"],
@@ -429,15 +748,12 @@ def cmd_toc(args, pdf: Path) -> dict:
                                    "page_start", "page_end")}
                 for s in sections
             ],
-            "toc_markdown": sections_markdown(sections, structure["title"],
-                                              structure["num_pages"]),
+            "toc_markdown": md,
         }
-        return make_result("ok", f"目录生成完成:{len(sections)} 个条目。",
-                           data, pdf=str(pdf), cache=cache)
-    # 默认直接输出 Markdown 目录
-    md = sections_markdown(sections, structure["title"], structure["num_pages"])
-    return make_result("ok", "目录生成完成。", {"toc_markdown": md},
-                       pdf=str(pdf), cache=cache)
+    if scheme:
+        data["url_scheme"] = scheme
+    msg = f"目录生成完成:{len(sections)} 个条目。" + (f"注意:{note}" if note else "")
+    return make_result("ok", msg, data, pdf=str(pdf), cache=cache)
 
 
 def cmd_locate(args, pdf: Path) -> dict:
@@ -515,31 +831,10 @@ def cmd_locate(args, pdf: Path) -> dict:
                        {"query": args.query}, pdf=str(pdf), cache=cache)
 
 
-def _launch_browser_with_url(url: str) -> bool:
-    """在 Windows 上用 Chrome/Edge 直接打开 file:///...#page=N。
-
-    背景:本机 file: 协议默认处理程序解析 file:/// URL 不可靠,会报
-    「Windows 找不到文件」,因此不走 cmd /c start,而是直接定位浏览器可执行文件。
-    返回是否成功启动。
-    """
-    cands = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for exe in cands:
-        if not os.path.isfile(exe):
-            continue
-        try:
-            subprocess.Popen([exe, url], close_fds=True)
-            return True
-        except OSError:
-            continue
-    return False
-
-
-def cmd_open(args, pdf: Path) -> dict:
+def cmd_link(args, pdf: Path) -> dict:
+    """生成对应页面/章节的可点击跳转链接。只生成链接,不打开任何程序——
+    "跳转"由用户点击链接完成。默认走内嵌 HTTP 服务(http 链接,webui/终端
+    均可点击);--file-url 时退回 file:/// 链接兜底。"""
     structure, cache = parse_pdf(pdf, use_cache=not args.no_cache)
     sections = build_sections(structure)
 
@@ -549,47 +844,41 @@ def cmd_open(args, pdf: Path) -> dict:
             return make_result("no_match",
                                f"页码 {page} 超出范围:该文档共 {structure['num_pages']} 页。",
                                {"page": page}, pdf=str(pdf), cache=cache)
-        where = f"第 {page} 页"
+        sec = deepest_section_on_page(page, [s for s in sections if not s.get("is_title")])
+        where = f"第 {page} 页" + (f"(「{sec['path']}」)" if sec else "")
     else:
         matches = rank_heading_matches(args.section, sections)
         if not matches:
             return make_result("no_match", f"未找到章节「{args.section}」。",
                                {"section": args.section}, pdf=str(pdf), cache=cache)
-        page = matches[0]["page_start"]
-        where = f"「{matches[0]['path']}」(第 {page} 页)"
+        top = matches[0]
+        page = top["page_start"]
+        where = f"「{top['path']}」(第 {page} 页)"
 
     abs_path = pdf.resolve()
-    url = abs_path.as_uri() + f"#page={page}"
-    data = {"page": page, "target": where, "url": url, "local_path": str(abs_path),
-            "launched": False}
-
-    if args.launch:
-        launch_note = ""
-        try:
-            if sys.platform == "win32":
-                # 优先用 Chrome/Edge 打开(支持 #page 跳页,且绕开不可靠的 file: 协议处理程序)
-                if _launch_browser_with_url(url):
-                    data["launched"] = True
-                    launch_note = "(浏览器)"
-                else:
-                    # 找不到浏览器则用系统默认阅读器打开本地文件(无法定位到具体页)
-                    os.startfile(str(abs_path))
-                    data["launched"] = True
-                    data["page_jump"] = False
-                    launch_note = "(默认阅读器,未能定位到具体页)"
-            else:
-                webbrowser.open(url)
-                data["launched"] = True
-            msg = f"已在系统阅读器中打开{where}{launch_note}。"
-        except OSError as exc:
-            # 启动失败时给出本地路径与页码,保证用户仍能手动打开
-            data["launch_failed"] = True
-            msg = (f"自动打开失败({exc})。请手动打开文件后翻到{where}:"
-                   f"{abs_path}")
-            return make_result("error", msg, data, pdf=str(pdf), cache=cache)
+    data = {"page": page, "target": where, "local_path": str(abs_path)}
+    note = ""
+    if args.file_url:
+        url = page_link(pdf, page)
+        data["url_scheme"] = "file"
     else:
-        msg = (f"已生成跳转链接:{where}。请点击该链接打开;若链接无法打开,"
-               f"请手动打开文件并翻到对应页:{abs_path}")
+        try:
+            port = ensure_http_serve(pdf)
+        except ServeError as exc:
+            # 内嵌服务不可用时不整体失败:退回 file:/// 链接,并如实说明原因
+            url = page_link(pdf, page)
+            data["url_scheme"] = "file"
+            data["http_server"] = {"error": str(exc), "file_url": url}
+            note = (f"内嵌 HTTP 服务不可用({exc}),链接为 file:/// 形式:"
+                    "浏览器可能拦截,请在终端 Ctrl+点击或用本地阅读器打开。")
+        else:
+            url = http_page_link(port, pdf, page)
+            data["url_scheme"] = "http"
+            data["http_server"] = {"port": port, "serving": pdf.name,
+                                   "file_url": page_link(pdf, page)}
+    data["url"] = url
+    msg = (f"已生成跳转链接:{where}。请以 Markdown 链接形式发给用户点击定位:"
+           f"{md_link(where, url)}" + (f"注意:{note}" if note else ""))
     return make_result("ok", msg, data, pdf=str(pdf), cache=cache)
 
 
@@ -599,7 +888,8 @@ def cmd_open(args, pdf: Path) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="doc_navigator",
-        description="AI 文档结构导航:解析文本型 PDF 结构、生成目录、定位章节/页面、跳转打开。",
+        description="AI 文档结构导航:解析文本型 PDF 结构、生成目录与层级化章节导航、"
+                    "定位章节/页面、生成可点击的章节/页码跳转链接。",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -611,9 +901,17 @@ def build_parser() -> argparse.ArgumentParser:
     common(p)
     p.add_argument("--list-items", action="store_true", help="同时输出列表项明细")
 
-    p = sub.add_parser("toc", help="生成目录(默认 Markdown)")
+    p = sub.add_parser("toc", help="生成目录(默认 Markdown 表格;--links 生成可点击目录)")
     common(p)
     p.add_argument("--json", action="store_true", help="以 JSON 输出结构化目录")
+    p.add_argument("--list", action="store_true",
+                   help="改回嵌套 Markdown 列表(终端更紧凑;聊天前端可能把子项挤进父项同一行)")
+    p.add_argument("--links", action="store_true",
+                   help="目录中的章节标题带 #page=N 可点击链接(默认经内嵌 HTTP 服务;"
+                        "页码为纯文本,避免同一 URL 每行重复、撑爆单条消息的输出上限)")
+    p.add_argument("--file-url", action="store_true",
+                   help="可点击目录退回 file:/// 链接(隐含 --links;"
+                        "内嵌 HTTP 服务不可用时也会自动退回)")
 
     p = sub.add_parser("locate", help="定位章节或页面")
     common(p)
@@ -624,13 +922,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-chars", type=int, default=800, help="--page 模式文本最大字符数(默认 800)")
     p.add_argument("--max-matches", type=int, default=5, help="最多返回的匹配数(默认 5)")
 
-    p = sub.add_parser("open", help="生成跳转链接(--launch 实际打开阅读器)")
+    p = sub.add_parser("link", help="生成对应页面/章节的可点击跳转链接(不打开任何程序)")
     common(p)
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--page", type=int, help="跳转到指定页")
-    g.add_argument("--section", help="跳转到指定章节(按标题匹配)")
-    p.add_argument("--launch", action="store_true",
-                   help="实际调用系统默认阅读器打开(建议先征得用户确认)")
+    g.add_argument("--page", type=int, help="生成跳转到指定页的链接")
+    g.add_argument("--section", help="生成跳转到指定章节(按标题匹配)的链接")
+    p.add_argument("--file-url", action="store_true",
+                   help="退回 file:/// 链接(默认经内嵌 HTTP 服务生成 http 链接,更易点击)")
+
+    # 隐藏子命令:内嵌 HTTP 服务的管理面,供 link/toc 自动调用,不面向用户
+    d = sub.add_parser("_serve-daemon", help=argparse.SUPPRESS)
+    d.add_argument("--port", type=int, required=True)
+    d.add_argument("--root", required=True)
+    d.add_argument("--name", required=True)
+    d.add_argument("--idle-timeout", type=int, default=_SERVE_IDLE_DEFAULT)
+
+    sub.add_parser("_serve-stop", help=argparse.SUPPRESS)
 
     return parser
 
@@ -653,6 +960,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_PARSE
 
     args = build_parser().parse_args(argv)
+
+    if args.command == "_serve-daemon":
+        return run_serve_daemon(args)
+    if args.command == "_serve-stop":
+        _serve_stop_all()
+        print(out_json(make_result("ok", "内嵌 HTTP 服务已全部停止。",
+                                   {"stopped": True})))
+        return EXIT_OK
+
     pdf = Path(args.pdf)
 
     if not pdf.exists():
@@ -674,10 +990,12 @@ def main(argv: list[str] | None = None) -> int:
             result = cmd_toc(args, pdf)
         elif args.command == "locate":
             result = cmd_locate(args, pdf)
-        elif args.command == "open":
-            result = cmd_open(args, pdf)
+        elif args.command == "link":
+            result = cmd_link(args, pdf)
         else:  # pragma: no cover
             result = make_result("error", f"未知命令:{args.command}")
+    except ServeError as exc:  # 内嵌 HTTP 服务问题单独提示,不要与解析失败混淆
+        result = make_result("error", f"服务启动失败:{exc}", {"pdf": str(pdf)})
     except Exception as exc:  # 解析失败等运行期异常统一兜底
         result = make_result("error", f"解析失败:{exc.__class__.__name__}: {exc}",
                              {"pdf": str(pdf)})
